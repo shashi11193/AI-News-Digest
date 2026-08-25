@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-AI News Digest Agent v2 — Deep Curation Edition
-Scrapes full article text for genuine summarization.
-Specific, technical "why it matters" for every story.
+AI News Digest Agent v3 — Reliable Deep Curation
+Smaller LLM batches, robust fallback, clean formatting.
 """
 
 import os
@@ -23,13 +22,12 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
-MAX_ARTICLES_PER_SOURCE = 20
+MAX_ARTICLES_PER_SOURCE = 15
 DAYS_BACK = 1
 MAX_LLM_RETRIES = 2
-MAX_FINAL_ARTICLES = 15
 HEALTH_LOG_PATH = "output/health_log.json"
 
-# ─── SOURCES — Expanded for broader coverage ───
+# ─── SOURCES ───
 SOURCES = {
     "google_news_llm": {
         "url": "https://news.google.com/rss/search?q=large+language+model+OR+LLM+OR+transformer+architecture+OR+mixture+of+experts&hl=en-US&gl=US&ceid=US:en",
@@ -196,11 +194,18 @@ def fetch_rss(name, config, health_log):
                 if hasattr(entry, field) and getattr(entry, field):
                     pub_date = datetime(*getattr(entry, field)[:6])
                     break
+
+            # Strict date filtering — reject if older than cutoff
             if pub_date and pub_date < cutoff:
                 continue
 
             title = entry.get("title", "").strip()
             if not title:
+                continue
+
+            # Skip obvious old content / reports with years far in the past
+            title_lower = title.lower()
+            if any(x in title_lower for x in ["market size, share", "trends report", "forecast to 20", "market research"]):
                 continue
 
             summary = ""
@@ -209,7 +214,7 @@ def fetch_rss(name, config, health_log):
                     val = getattr(entry, field)
                     if isinstance(val, list) and val:
                         val = val[0].get("value", "")
-                    summary = val[:800] if val else ""
+                    summary = val[:1000] if val else ""
                     break
             summary = re.sub(r"<[^>]+>", " ", summary).strip()
 
@@ -261,20 +266,20 @@ def fetch_github_trending():
     return articles
 
 
-# ─── SCRAPE FULL ARTICLE CONTENT ───
+# ─── SCRAPE ARTICLE CONTENT ───
 
 def fetch_article_content(url):
-    """Use jina.ai reader API to extract full article text. Free, no auth."""
+    """Extract full article text via jina.ai reader."""
     if not url or not url.startswith("http"):
         return ""
     try:
-        jina_url = f"https://r.jina.ai/http://{url.replace('https://', '').replace('http://', '')}"
+        clean_url = url.replace("https://", "").replace("http://", "")
+        jina_url = f"https://r.jina.ai/http://{clean_url}"
         resp = requests.get(jina_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code == 200:
             text = resp.text.strip()
-            # Truncate to avoid token overload
-            if len(text) > 6000:
-                text = text[:6000] + "... [truncated]"
+            if len(text) > 4000:
+                text = text[:4000] + "... [truncated]"
             return text
     except Exception as e:
         print(f"[SCRAPE FAIL] {url[:60]}...: {e}")
@@ -301,13 +306,23 @@ def deduplicate(articles):
     return unique
 
 
-# ─── LLM CURATION — DEEP ANALYSIS ───
+# ─── LLM CURATION ───
+
+def call_llm(prompt, system_prompt, provider):
+    """Call LLM with detailed error logging."""
+    if provider == "groq" and GROQ_API_KEY:
+        return call_groq(prompt, system_prompt)
+    elif provider == "gemini" and GEMINI_API_KEY:
+        return call_gemini(prompt)
+    return None, "no_key"
+
 
 def call_groq(prompt, system_prompt, retries=MAX_LLM_RETRIES):
     if not GROQ_API_KEY:
-        return None
+        return None, "no_groq_key"
     for attempt in range(retries):
         try:
+            print(f"[GROQ] Attempt {attempt+1}...")
             resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -317,72 +332,85 @@ def call_groq(prompt, system_prompt, retries=MAX_LLM_RETRIES):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    "temperature": 0.15,
-                    "max_tokens": 6000,
-                    "response_format": {"type": "json_object"}
+                    "temperature": 0.2,
+                    "max_tokens": 5000
                 },
-                timeout=90
+                timeout=120
             )
-            resp.raise_for_status()
+            print(f"[GROQ] Status: {resp.status_code}")
+            if resp.status_code != 200:
+                print(f"[GROQ] Error body: {resp.text[:500]}")
+                if attempt < retries - 1:
+                    import time
+                    time.sleep(3)
+                continue
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            return json.loads(content)
+            # Extract JSON from response
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group()), "groq"
+            return json.loads(content), "groq"
         except Exception as e:
-            print(f"[GROQ] Attempt {attempt+1}/{retries} failed: {e}")
+            print(f"[GROQ] Attempt {attempt+1} failed: {e}")
             if attempt < retries - 1:
                 import time
-                time.sleep(2 ** attempt)
-    return None
+                time.sleep(3)
+    return None, "groq_failed"
 
 
 def call_gemini(prompt, retries=MAX_LLM_RETRIES):
     if not GEMINI_API_KEY:
-        return None
+        return None, "no_gemini_key"
     for attempt in range(retries):
         try:
+            print(f"[GEMINI] Attempt {attempt+1}...")
             resp = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
                 headers={"Content-Type": "application/json"},
                 json={
                     "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json", "temperature": 0.15}
+                    "generationConfig": {"temperature": 0.2}
                 },
-                timeout=90
+                timeout=120
             )
-            resp.raise_for_status()
+            print(f"[GEMINI] Status: {resp.status_code}")
+            if resp.status_code != 200:
+                print(f"[GEMINI] Error body: {resp.text[:500]}")
+                if attempt < retries - 1:
+                    import time
+                    time.sleep(3)
+                continue
             data = resp.json()
             content = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(content)
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group()), "gemini"
+            return json.loads(content), "gemini"
         except Exception as e:
-            print(f"[GEMINI] Attempt {attempt+1}/{retries} failed: {e}")
+            print(f"[GEMINI] Attempt {attempt+1} failed: {e}")
             if attempt < retries - 1:
                 import time
-                time.sleep(2 ** attempt)
-    return None
+                time.sleep(3)
+    return None, "gemini_failed"
 
 
 def curate_articles(articles):
-    """Deep curation with full article content."""
+    """Curate with smaller batches and robust fallback."""
 
-    # Scrape content for top articles
-    print("\n[SCRAPE] Fetching full article text for top candidates...")
+    # Scrape content for top candidates
+    print("\n[SCRAPE] Fetching article text...")
     enriched = []
-    for art in articles[:35]:  # Scrape top 35 to stay within token limits
+    for art in articles[:25]:
         content = fetch_article_content(art["url"])
-        if content:
-            art["full_text"] = content
-            enriched.append(art)
-        else:
-            # Keep it but mark as thin
-            art["full_text"] = art["summary"] or "[Content unavailable]"
-            enriched.append(art)
+        art["full_text"] = content if content else (art["summary"] or "[No content available]")
+        enriched.append(art)
+    print(f"[SCRAPE] Enriched {len(enriched)} articles")
 
-    print(f"[SCRAPE] Enriched {len(enriched)} articles with full text")
-
-    # Build prompt with ACTUAL article content
+    # Build prompt — smaller batches to avoid token/time limits
     article_blocks = []
-    for i, a in enumerate(enriched[:30]):
-        text = a["full_text"][:2500]  # Cap each article to manage tokens
+    for i, a in enumerate(enriched[:20]):
+        text = a["full_text"][:1500]  # Cap at 1500 chars per article
         block = f"""ARTICLE [{i+1}]
 TITLE: {a['title']}
 SOURCE: {a['source']} | URL: {a['url']}
@@ -394,79 +422,90 @@ CONTENT:
 
     article_text = "\n\n".join(article_blocks)
 
-    system_prompt = """You are an elite AI research analyst and distinguished engineer at a top AI lab. You read AI news deeply and write sharp, technical briefs for senior AI engineers who also do research.
+    system_prompt = """You are a senior AI staff engineer who writes internal research briefs. You read AI news deeply and produce sharp, specific analysis.
 
-Your task: Review the provided articles (with FULL TEXT) and select ALL genuinely significant stories. Do NOT limit yourself to a fixed number — if there are 12 important stories, include 12. If there are only 5, include 5. Maximum cap: 15 stories.
+TASK: Review the articles below (with their actual content) and select ALL genuinely significant stories. Include as many as deserve inclusion, up to a maximum of 15. If only 4 matter, include 4. If 12 matter, include 12.
 
-For EACH selected article, output EXACTLY these fields:
-- headline: A clean, informative title (rewrite if the original is clickbait)
+For EACH selected article, output:
+- headline: Clean, informative title. Rewrite if the original is clickbait or vague.
 - url: The link
 - source: Where it came from
 - category: One of [LLMs | GenAI | Agents | Robotics | Hardware | Safety | Evaluation | Vision | Tools | Research | Releases]
-- summary: A 3-4 sentence ORIGINAL summary based on the actual article content. Do NOT copy the title. Do NOT repeat RSS metadata. Explain what actually happened, what was built/released/discovered, and key technical details.
-- why_it_matters: A 3-4 sentence technical analysis SPECIFIC to this exact article. Reference concrete details: model names, benchmark scores, architecture choices, companies involved, competitive implications, or research directions. NEVER use generic phrases like "this is important for AI engineers" or "this advances the field." Instead say things like "Mistral's new 8x22B MoE architecture achieves 45% better throughput than dense equivalents at the same parameter count, which directly impacts inference cost for production LLM deployments" or "This paper introduces a new attention mechanism that reduces KV cache memory by 60%, solving a critical bottleneck for long-context applications."
+- summary: 3-4 sentences summarizing the actual content. Explain what was built, released, discovered, or changed. Include specific names, numbers, or technical details when present.
+- why_it_matters: 3-4 sentences of specific technical or strategic analysis. Reference concrete details from the article. Explain the implication for practitioners, researchers, or the competitive landscape. NEVER write generic statements.
 
-CRITICAL RULES:
-1. You have the FULL ARTICLE TEXT. Read it. Summarize from it. Do not guess.
-2. If the article is thin on technical details (pure PR, no specs, no numbers), REJECT it.
-3. Each summary and why_it_matters must be UNIQUE. Never copy-paste language between articles.
-4. Prioritize: new model releases with specs, benchmark results with numbers, novel architectures, open-source code releases, safety research with concrete findings, hardware efficiency gains with metrics, major funding/product launches that change competitive dynamics.
-5. Reject: vague partnership announcements, executive hires without technical impact, marketing blog posts without new information, incremental UI updates.
-6. Output ONLY valid JSON.
+STRICT RULES:
+1. You have the FULL ARTICLE TEXT. Read it. Summarize FROM it.
+2. If the article lacks technical substance (pure PR, no specs, no numbers), skip it.
+3. Each summary and why_it_matters must be completely unique. Never reuse phrasing.
+4. Prioritize: new model releases with specs, benchmark results with numbers, novel architectures, open-source code, safety research with findings, hardware gains with metrics.
+5. Skip: vague partnerships, executive hires, marketing fluff, incremental UI updates, old market research reports.
+6. Output ONLY a JSON object with a "selected" array."""
 
-Output format:
-{
-  "selected": [
-    {
-      "headline": "...",
-      "url": "...",
-      "source": "...",
-      "category": "...",
-      "summary": "...",
-      "why_it_matters": "..."
-    }
-  ]
-}"""
+    user_prompt = f"Review these {len(enriched[:20])} articles from the last 24 hours.\n\n{article_text}\n\nOutput ONLY JSON: {{\"selected\": [...]}}"
 
-    user_prompt = f"Review these {len(enriched[:30])} articles from the last 24 hours. Read the full content provided and select all significant ones (up to 15).\n\n{article_text}"
-
+    # Try primary provider
     result = None
     used_provider = None
+    error_reason = ""
 
-    if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
-        result = call_gemini(user_prompt)
-        used_provider = "gemini"
-
-    if not result and GROQ_API_KEY:
-        result = call_groq(user_prompt, system_prompt)
+    if LLM_PROVIDER == "groq" and GROQ_API_KEY:
+        result, status = call_llm(user_prompt, system_prompt, "groq")
         used_provider = "groq"
+        error_reason = status
+        print(f"[CURATE] Groq result: {status}")
 
-    if not result and GEMINI_API_KEY and LLM_PROVIDER != "gemini":
-        result = call_gemini(user_prompt)
-        used_provider = "gemini (fallback)"
+    if not result and GEMINI_API_KEY:
+        result, status = call_llm(user_prompt, system_prompt, "gemini")
+        used_provider = "gemini"
+        error_reason = status
+        print(f"[CURATE] Gemini result: {status}")
+
+    if not result and GROQ_API_KEY and LLM_PROVIDER != "groq":
+        result, status = call_llm(user_prompt, system_prompt, "groq")
+        used_provider = "groq (fallback)"
+        error_reason = status
+        print(f"[CURATE] Groq fallback result: {status}")
 
     if result and "selected" in result:
         selected = result["selected"]
-        print(f"[CURATE] {used_provider} selected {len(selected)} articles")
-        return selected, used_provider
+        # Validate: reject if summaries are all identical (generic failure mode)
+        summaries = [s.get("summary", "") for s in selected[:3]]
+        if len(set(summaries)) == 1 and len(summaries) > 1:
+            print("[CURATE] WARNING: LLM returned identical summaries. Using fallback.")
+        else:
+            print(f"[CURATE] {used_provider} selected {len(selected)} articles")
+            return selected, used_provider
 
-    # Fallback
-    print("[FALLBACK] All LLM providers failed. Sending raw top articles.")
+    # ─── INTELLIGENT FALLBACK ───
+    print(f"[FALLBACK] LLM failed ({error_reason}). Building digest from scraped content.")
     fallback = []
-    for a in articles[:10]:
+    for a in enriched[:12]:
+        content = a.get("full_text", "") or a["summary"]
+        # Extract first few sentences as summary
+        sentences = re.split(r"(?<=[.!?])\s+", content)
+        summary = " ".join(sentences[:3])[:400] if sentences else content[:400]
+        if not summary or len(summary) < 50:
+            summary = a["summary"][:400] if a["summary"] else "See article for details."
+
+        # Generate a basic why_it_matters from category
+        cat = a["category"]
+        why = f"Article from {a['source']} in the {cat} category. Review for technical details and implications."
+
         fallback.append({
             "headline": a["title"],
             "url": a["url"],
             "source": a["source"],
-            "category": a["category"],
-            "summary": a.get("full_text", a["summary"])[:300] + "... [LLM curation unavailable — read full article]",
-            "why_it_matters": "Curation service temporarily unavailable. Article surfaced from trusted AI source.",
+            "category": cat,
+            "summary": summary,
+            "why_it_matters": why,
             "fallback": True
         })
-    return fallback, "raw_fallback"
+
+    return fallback, f"fallback ({error_reason})"
 
 
-# ─── EMAIL FORMATTING — NO ACTION ITEMS ───
+# ─── EMAIL FORMATTING ───
 
 def generate_email_html(articles, date_str, meta_info):
     cat_colors = {
@@ -479,11 +518,11 @@ def generate_email_html(articles, date_str, meta_info):
     health_banner = ""
     disabled_sources = meta_info.get("disabled_sources", [])
     if disabled_sources:
-        health_banner = f"""<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 14px;margin-bottom:20px;font-size:12px;color:#856404;">⚠️ <strong>Source Health:</strong> {len(disabled_sources)} source(s) temporarily disabled: {', '.join(disabled_sources)}. Auto-retrying tomorrow.</div>"""
+        health_banner = f"""<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 14px;margin-bottom:20px;font-size:12px;color:#856404;">⚠️ <strong>Source Health:</strong> {len(disabled_sources)} source(s) temporarily disabled: {', '.join(disabled_sources)}.</div>"""
 
     fallback_banner = ""
     if meta_info.get("used_fallback"):
-        fallback_banner = """<div style="background:#d1ecf1;border:1px solid #bee5eb;border-radius:6px;padding:10px 14px;margin-bottom:20px;font-size:12px;color:#0c5460;">ℹ️ <strong>Note:</strong> LLM curation temporarily unavailable. Articles shown raw from trusted sources.</div>"""
+        fallback_banner = """<div style="background:#d1ecf1;border:1px solid #bee5eb;border-radius:6px;padding:10px 14px;margin-bottom:20px;font-size:12px;color:#0c5460;">ℹ️ <strong>Note:</strong> Deep curation temporarily unavailable today. Articles summarized from original content.</div>"""
 
     articles_html = ""
     for i, art in enumerate(articles, 1):
@@ -492,24 +531,20 @@ def generate_email_html(articles, date_str, meta_info):
         fallback_tag = "<span style='background:#95a5a6;color:white;padding:2px 8px;border-radius:10px;font-size:10px;margin-left:6px;'>RAW</span>" if art.get("fallback") else ""
 
         articles_html += f"""
-        <div style="margin-bottom:36px;padding-bottom:28px;border-bottom:1px solid #e9ecef;">
+        <div style="margin-bottom:32px;padding-bottom:24px;border-bottom:1px solid #e9ecef;">
             <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
                 <span style="background:{color};color:white;padding:4px 12px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">{cat}</span>
                 <span style="color:#6c757d;font-size:12px;">{art.get('source','Unknown')}</span>
                 {fallback_tag}
             </div>
-            <h3 style="margin:0 0 12px 0;font-size:19px;line-height:1.4;color:#212529;">
+            <h3 style="margin:0 0 12px 0;font-size:18px;line-height:1.4;color:#212529;">
                 <a href="{art.get('url','#')}" style="color:#212529;text-decoration:none;">{i}. {art.get('headline', art.get('title','Untitled'))}</a>
             </h3>
-            <div style="background:#f8f9fa;border-radius:8px;padding:16px 18px;margin-bottom:12px;">
-                <p style="margin:0 0 10px 0;color:#495057;line-height:1.65;font-size:14.5px;">
-                    <strong style="color:#212529;">Summary:</strong> {art.get('summary','No summary available.')}
-                </p>
+            <div style="background:#f8f9fa;border-radius:8px;padding:14px 16px;margin-bottom:10px;">
+                <p style="margin:0;color:#495057;line-height:1.6;font-size:14px;">{art.get('summary','No summary available.')}</p>
             </div>
-            <div style="background:#fff;border-left:4px solid {color};padding:14px 18px;border-radius:0 8px 8px 0;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
-                <p style="margin:0;color:#343a40;line-height:1.65;font-size:14.5px;">
-                    <strong style="color:{color};">💡 Why it matters:</strong> {art.get('why_it_matters','See article for details.')}
-                </p>
+            <div style="background:#fff;border-left:4px solid {color};padding:12px 16px;border-radius:0 6px 6px 0;">
+                <p style="margin:0;color:#343a40;line-height:1.6;font-size:14px;"><strong style="color:{color};">Why it matters:</strong> {art.get('why_it_matters','')}</p>
             </div>
         </div>
         """
@@ -519,26 +554,26 @@ def generate_email_html(articles, date_str, meta_info):
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
 <body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#f8f9fa;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8f9fa;">
-<tr><td align="center" style="padding:32px 16px;">
-<table width="720" cellpadding="0" cellspacing="0" border="0" style="background:white;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,0.06);max-width:100%;">
+<tr><td align="center" style="padding:28px 16px;">
+<table width="700" cellpadding="0" cellspacing="0" border="0" style="background:white;border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,0.06);max-width:100%;">
 <tr>
-<td style="padding:36px 36px 24px 36px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:16px 16px 0 0;">
-<h1 style="margin:0;color:white;font-size:26px;font-weight:700;letter-spacing:-0.3px;">🧠 AI Daily Brief</h1>
-<p style="margin:8px 0 0 0;color:rgba(255,255,255,0.85);font-size:14px;">{date_str} | Deep-curated for Senior AI Engineers & Researchers</p>
+<td style="padding:30px 32px 20px 32px;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);border-radius:14px 14px 0 0;">
+<h1 style="margin:0;color:white;font-size:24px;font-weight:700;letter-spacing:-0.3px;">🧠 AI Daily Brief</h1>
+<p style="margin:6px 0 0 0;color:rgba(255,255,255,0.7);font-size:13px;">{date_str}</p>
 </td>
 </tr>
 <tr>
-<td style="padding:18px 36px;background:#f8f9fa;border-bottom:1px solid #e9ecef;">
-<p style="margin:0;color:#6c757d;font-size:13px;line-height:1.5;">
-📊 <strong>{len(articles)} stories</strong> deep-curated from 50+ global sources | Provider: {meta_info.get('provider','Unknown')} | Active sources: {meta_info.get('active_sources','?')}/{meta_info.get('total_sources','?')}
+<td style="padding:14px 32px;background:#f8f9fa;border-bottom:1px solid #e9ecef;">
+<p style="margin:0;color:#6c757d;font-size:12px;">
+📊 {len(articles)} stories | {meta_info.get('provider','Unknown')} | {meta_info.get('active_sources','?')}/{meta_info.get('total_sources','?')} sources active
 </p>
 </td>
 </tr>
-<tr><td style="padding:0 36px;">{health_banner}{fallback_banner}</td></tr>
-<tr><td style="padding:28px 36px;">{articles_html}</td></tr>
+<tr><td style="padding:0 32px;">{health_banner}{fallback_banner}</td></tr>
+<tr><td style="padding:24px 32px;">{articles_html}</td></tr>
 <tr>
-<td style="padding:22px 36px;background:#f8f9fa;border-radius:0 0 16px 16px;text-align:center;">
-<p style="margin:0;color:#adb5bd;font-size:12px;">Generated by AI News Digest Agent | <a href="https://github.com/shashi11193/AI-News-Digest" style="color:#667eea;text-decoration:none;">View Source</a></p>
+<td style="padding:18px 32px;background:#f8f9fa;border-radius:0 0 14px 14px;text-align:center;">
+<p style="margin:0;color:#adb5bd;font-size:11px;">AI News Digest Agent | <a href="https://github.com/shashi11193/AI-News-Digest" style="color:#667eea;text-decoration:none;">Source</a></p>
 </td>
 </tr>
 </table>
@@ -551,7 +586,7 @@ def generate_email_html(articles, date_str, meta_info):
 
 def send_email(html_content, date_str):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
-        print("[WARN] Email credentials missing, saving to file only")
+        print("[WARN] Email credentials missing")
         return False
     try:
         msg = MIMEMultipart("alternative")
@@ -573,7 +608,7 @@ def send_email(html_content, date_str):
 
 def main():
     print("="*65)
-    print("🧠 AI NEWS DIGEST AGENT v2 — Deep Curation Edition")
+    print("🧠 AI NEWS DIGEST AGENT v3")
     print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*65)
 
@@ -604,7 +639,7 @@ def main():
     disabled_sources = [k for k, v in health_log.items() if v.get("disabled", False)]
     meta_info = {
         "provider": provider_used,
-        "used_fallback": provider_used == "raw_fallback",
+        "used_fallback": "fallback" in provider_used.lower(),
         "disabled_sources": disabled_sources,
         "active_sources": len(SOURCES) - len(disabled_sources),
         "total_sources": len(SOURCES)
